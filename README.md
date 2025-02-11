@@ -20,8 +20,7 @@
 ## 一些问题
 + 并没有观察到Aha Moment，也就是在think阶段并没有反思总结之类的思考出现。
 + 在训练2000 step后，模型出现think的内容和answer内容不一致，比如think想要实现segment tree，但是answer并没有实现。而且似乎answer的代码越来越短。猜测是可能数据集里没有强样例，所以用segment tree实现性价比不高，复杂容易写错不说，也带不来更高的reward。
-+ 回答确实开始逐渐拟人，比如会说I blabla，we blabla，刚开始模型的回复还是那种标准的列出1 2 3 4 5，类似于题解的答案。但是到了3000 step左右开始think开始有些语法不对的情况了。![言语混乱](./images/confuse.png)可以观察到验证集合的指标是一直在涨的，
-
++ 回答确实开始逐渐拟人，比如会说I blabla，we blabla，刚开始模型的回复还是那种标准的列出1 2 3 4 5，类似于题解的答案。但是到了3000 step左右开始think开始有些语法不对的情况了。![言语混乱](./images/confuse.png)
 
 ## Acknowledgements
 + 项目中使用[verl](https://github.com/volcengine/verl)框架做了一定的修改，比如计算rule-base reward的时候为了加速采用了多线程等。
