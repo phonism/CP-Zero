@@ -206,7 +206,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
 
-        select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages']
+        select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages', 'bash_result_attention_mask']
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
         batch = data.select(batch_keys=select_keys).batch
@@ -234,7 +234,9 @@ class DataParallelPPOActor(BasePPOActor):
                 responses = data['responses']
                 response_length = responses.size(1)
                 attention_mask = data['attention_mask']
-                response_mask = attention_mask[:, -response_length:]
+                # TODO
+                bash_result_attention_mask = data["bash_result_attention_mask"]
+                response_mask = bash_result_attention_mask[:, -response_length:]
                 old_log_prob = data['old_log_probs']
                 advantages = data['advantages']
 

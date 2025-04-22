@@ -174,6 +174,7 @@ class LLM(LLM):
     def _post_process_outputs(self, request_outputs: List[RequestOutput]) -> Tuple[torch.Tensor, torch.Tensor]:
         output_token_ids = []
         logprobs = []
+        stop_reasons = []
         for request_output in request_outputs:  # List[RequestOutput]
             outputs = request_output.outputs
             for output in outputs:  # List[CompletionOutput], usually len == 1
@@ -185,13 +186,14 @@ class LLM(LLM):
                     for logprobs_dict, id in zip(logprobs_dicts, output.token_ids):
                         logprob.append(logprobs_dict[id].logprob)
                     logprobs.append(torch.tensor(logprob))
+                stop_reasons.append(output.stop_reason)
 
         pad_token_id = (self.llm_engine.tokenizer.pad_token_id if self.llm_engine.tokenizer.pad_token_id is not None
                         else self.llm_engine.tokenizer.eos_token_id)
         output_token_ids = pad_sequence(output_token_ids, batch_first=True, padding_value=pad_token_id)
         if len(logprobs) > 0:
             logprobs = pad_sequence(logprobs, batch_first=True, padding_value=pad_token_id)
-        return output_token_ids, logprobs
+        return output_token_ids, logprobs, stop_reasons
 
     def sync_model_weights(self, actor_weights: Dict[str, torch.Tensor], load_format: str) -> None:
         self.llm_engine.sync_model_weights(actor_weights=actor_weights, load_format=load_format)

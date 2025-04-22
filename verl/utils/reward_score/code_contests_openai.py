@@ -24,6 +24,7 @@ class OnlineJudge(object):
         return "python3.10"
     
     def run_test_case(self, file_name, lan_bin, code_string, one_in, one_out):
+        print(file_name, lan_bin)
         if lan_bin == "c++":
             p = subprocess.Popen("ulimit -c 0 && " + file_name,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -53,9 +54,11 @@ class OnlineJudge(object):
 
     def check_ce(self, code_string):
         if code_string is None or code_string == "":
-            return True
-        file_name = "tmp/" + str(random.randint(1, 10000000000))
+            return True, "code string is empty"
+        err = ""
+        file_name = "/root/workspace/CP-Zero/tmp/" + str(random.randint(1, 10000000000))
         f = open(file_name + ".cpp", "w+")
+        code_string = code_string.replace("'\n'", "'\\n'").replace("\"\n\"", "\"\\n\"")
         f.write(code_string)
         f.close()
         p = subprocess.Popen("c++ -o " + file_name + " " + file_name + ".cpp",
@@ -64,13 +67,13 @@ class OnlineJudge(object):
                 shell=True)
         ce = False
         try:
+        #if True:
             output, errors = p.communicate("", timeout=10)
-            if errors != b"":
+            if errors != b"" and str(errors).find("error:") != -1:
                 ce = True
-                print(errors)
+                err = str(errors)
         except:
             ce = True
-            os.killpg(os.getpgid(p.pid), signal.SIGTERM)
             output = b"" 
         try:
             #os.remove(file_name + ".cpp")
@@ -81,16 +84,17 @@ class OnlineJudge(object):
             os.remove(file_name)
         except:
             pass
-        return ce
+        return ce, err
 
     def compile(self, code_string):
         if code_string is None or code_string == "":
             return True
         md5_hash = hashlib.md5()
         md5_hash.update(code_string.encode("utf-8") + str(time.time()).encode("utf-8"))
-        file_name = "./tmp/" + md5_hash.hexdigest()
+        file_name = "/root/workspace/CP-Zero/tmp/" + md5_hash.hexdigest()
         #file_name = "tmp/" + str(random.randint(1, 10000000000))
         f = open(file_name + ".cpp", "w+")
+        code_string = code_string.replace("'\n'", "'\\n'").replace("\"\n\"", "\"\\n\"")
         f.write(code_string)
         f.close()
         p = subprocess.Popen("c++ -o " + file_name + " " + file_name + ".cpp",
@@ -100,10 +104,10 @@ class OnlineJudge(object):
         ce = False
         try:
             output, errors = p.communicate("", timeout=10)
-            if errors != b"":
+            if errors != b"" and str(errors).find("error:") != -1:
+                print(errors)
                 ce = True
         except:
-            os.killpg(os.getpgid(p.pid), signal.SIGTERM)
             output = b"" 
         try:
             os.remove(file_name + ".cpp")
@@ -170,8 +174,9 @@ def extract_solution(solution_str: str) -> Tuple[Optional[str], str]:
         processed_str = solution_str.split("<|im_start|>assistant", 1)[1]
         question_str = solution_str.split("<|im_start|>assistant", 1)[0]
     else:
+        print(solution_str)
         print("[Error] Failed to locate model response header")
-        return None, solution_str, ""
+        return "", solution_str, ""
 
     # Extract final answer using XML-style tags
     answer_pattern = r'<answer>(.*?)</answer>'
@@ -179,7 +184,7 @@ def extract_solution(solution_str: str) -> Tuple[Optional[str], str]:
     
     if not matches:
         print("[Error] No valid answer tags found")
-        return None, processed_str, question_str
+        return "", processed_str, question_str
         
     final_answer = matches[-1].group(1).strip()
     return final_answer, processed_str, question_str
@@ -202,7 +207,9 @@ def validate_response_structure(processed_str: str) -> bool:
         'think_start': ('<think>', 1),
         'think_end': ('</think>', 1),
         'answer_start': ('<answer>', 1),
-        'answer_end': ('</answer>', 1)
+        'answer_end': ('</answer>', 1),
+        'bash_start': ('<|bash_start|>', None),
+        'bash_end': ('<|bash_end|>', None)
     }
 
     positions = {}
@@ -212,7 +219,7 @@ def validate_response_structure(processed_str: str) -> bool:
         
         debug_str.append(f"  {tag_str}: count={count}, position={pos}")
         
-        if count != expected_count:
+        if expected_count is not None and count != expected_count:
             debug_str.append(f"  [Error] {tag_str} appears {count} times (expected {expected_count})")
             validation_passed = False
 
@@ -221,9 +228,6 @@ def validate_response_structure(processed_str: str) -> bool:
         positions['think_end'] > positions['answer_start'] or
         positions['answer_start'] > positions['answer_end']):
         debug_str.append("  [Error] Incorrect tag order: Expected <think>...</think><answer>...</answer>")
-        validation_passed = False
-    elif processed_str.strip()[-len("</answer><|endoftext|>"):] != "</answer><|endoftext|>":
-        debug_str.append("  [Error] Incorrect end token: Expected </answer><|endoftext|>")
         validation_passed = False
     elif processed_str.strip()[0:len("<think>")] != "<think>":
         debug_str.append("  [Error] Incorrect start token: Expected <think>")
@@ -269,18 +273,25 @@ def compute_score(solution_str: str,
 
     # Validate answer content
     answer_score = 0
-    if oj.check_ce(answer_text):
-        debug_str.append("Compile Error!")
+    is_ce, err = oj.check_ce(answer_text)
+    if is_ce:
+        debug_str.append("Compile Error!" + err)
         answer_score = 0
     else:
         answer_score += 1
         answer_score = oj.run(answer_text, ground_truth)
 
-    total_score = format_score + answer_score
+    tool_call_score = -8
+    if processed_str.find("<execute_command>") != -1 and processed_str.find("</execute_command>") != -1:
+        tool_call_score = 0
+
+
+    total_score = format_score + answer_score + tool_call_score
     debug_str.append("\n" + "-"*80)
     debug_str.append(f" Final Score ".center(80, '-'))
     debug_str.append(f"  Format: {format_score}")
     debug_str.append(f"  Answer: {answer_score}")
+    debug_str.append(f"  ToolCall: {tool_call_score}")
     debug_str.append(f"  Total: {total_score}")
     debug_str.append("="*80 + "\n")
 
@@ -288,4 +299,4 @@ def compute_score(solution_str: str,
 
 if __name__ == "__main__":
     oj = OnlineJudge()
-    print(oj.run("#include <bits/stdc++.h>\nusing namespace std;\nint main() {\n  string s;\n  cin >> s;\n  for(int j = 0; j < 10000000; ++j) for (int i = 0; i < s.length(); i++) {\n    if (s[i] == s[i + 1] && s[i] == s[i + 2]) {\n      cout << s[i];\n      return 0;\n    }\n  }\n  cout << -1;\n  return 0;\n}\n", {"input": [123123123129912857127437128819329319200] * 200, "output":[1] * 200}))
+    print(oj.run("#include <bits/stdc++.h>\nusing namespace std;\nint main() {\n  string s;\n  cin >> s;\n  for(int j = 0; j < 10000000; ++j) for (int i = 0; i < s.length(); i++) {\n    if (s[i] == s[i + 1] && s[i] == s[i + 2]) {\n      cout << s[i];\n      return 0;\n    }\n  }\n  cout << -1 << '\n';\n  return 0;\n}\n", {"input": [123123123129912857127437128819329319200] * 200, "output":[1] * 200}))

@@ -31,6 +31,9 @@ import torch
 import torch.distributed
 from tensordict import TensorDict
 from torch import nn
+import json
+import re
+import subprocess
 
 from verl import DataProto
 from verl.utils.torch_functional import get_eos_mask, pad_sequence_to_length
@@ -38,6 +41,11 @@ from verl.workers.rollout.base import BaseRollout
 from verl.third_party.vllm import LLM, vllm_version
 from verl.third_party.vllm import parallel_state as vllm_ps
 from vllm import SamplingParams
+import hashlib
+import time
+import os
+import shutil
+
 
 # TODO
 # 1. support pp in vllm
@@ -52,6 +60,14 @@ def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[in
     non_pad_index = torch.nonzero(prompt_token_ids != pad_token_id, as_tuple=False)[0][0]
     token_ids = prompt_token_ids[non_pad_index:].tolist()
     return token_ids
+
+def delete_directory(path):
+    try:
+        shutil.rmtree(path)
+        print(f"Directory '{path}' deleted successfully.")
+    except OSError as e:
+        print(f"Error: {e}")
+
 
 
 class vLLMRollout(BaseRollout):
@@ -127,6 +143,7 @@ class vLLMRollout(BaseRollout):
         self.sampling_params = SamplingParams(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id
+        self.tokenizer = tokenizer
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -176,22 +193,173 @@ class vLLMRollout(BaseRollout):
                 'n': 1  # if greedy, only 1 response
             }
 
+        debug_str = []
+
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
-            output = self.inference_engine.generate(
-                prompts=None,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                prompt_token_ids=idx_list,
-                use_tqdm=False)
+            #setattr(self.sampling_params, "stop_token_ids", [151645, 151643, 151658])
+            setattr(self.sampling_params, "stop_token_ids", [151645, 151643])
+            setattr(self.sampling_params, "stop", "</execute_command>")
+            setattr(self.sampling_params, "include_stop_str_in_output", True)
+            setattr(self.sampling_params, "detokenize", True)
+            debug_str.append("[LQ_DEBUG]: " + str(self.sampling_params))
+            debug_str.append("[LQ_DEBUG]: do_sample=" + str(do_sample))
+            debug_str.append("[LQ_DEBUG]: batch_size="+ str(batch_size))
+            print(self.sampling_params)
+            all_outputs = []
+            response_bash_result_attention_mask_list = []
+            for i in range(batch_size):
+                nums = self.config.n
+                if not do_sample:
+                    nums = 1
+                for j in range(nums):
+                    prompt_token_ids = idx_list[i]
+                    output_single = [[], [], []]
+                    max_length = getattr(self.sampling_params, "max_tokens")
+                    all_response_str = ""
+                    file_path_list = []
+                    while True:
+                        setattr(self.sampling_params, "n", 1)
+                        generated_ids = self.inference_engine.generate(
+                                prompts=None,
+                                sampling_params=self.sampling_params,
+                                prompt_token_ids=[prompt_token_ids],
+                                use_tqdm=False
+                        )
+                        output_single[0] += generated_ids[0][0].tolist()
+                        output_single[1] += generated_ids[1][0].tolist()
+                        output_single[2] += [1] * len(generated_ids[0][0].tolist())
+                        stop_reason = generated_ids[2][0]
+                        #debug_str.append("[LQ_DEBUG]: generated_ids=" + str(generated_ids))
+                        if generated_ids[0][0][-1] == 151645 or generated_ids[0][0][-1] == 151643:
+                            all_outputs.append([
+                                output_single[0][:min(max_length, len(output_single[0]))],
+                                output_single[1][:min(max_length, len(output_single[1]))],
+                                output_single[2][:min(max_length, len(output_single[2]))],
+                            ])
+                            debug_str.append("[LQ_DEBUG]: " + str(len(output_single[0])))
+                            break
+                        if stop_reason == "</execute_command>":
+                            BASH_RESULT_START_TAG = "<|im_end|>\n<|im_start|>user\n<command_result>\n"
+                            BASH_RESULT_END_TAG = "\n</command_result>\n<|im_end|>\n<|im_start|>assistant\n"
+                            def extract_tool_call_content(text):
+                                match = re.search(r'<execute_command>(.*?)</execute_command>', text, re.DOTALL)
+                                return match.group(1) if match else None
+                            def extract_command(text):
+                                matches = re.findall(r'<command>(.*?)</command>', text, re.DOTALL)
+                                return matches if matches else None
+                            response_str = self.tokenizer.decode(generated_ids[0][0])
+                            all_response_str += response_str
+                            tc_content = extract_tool_call_content(response_str)
+                            if tc_content is None:
+                                prompt_token_ids = prompt_token_ids + generated_ids[0][0].tolist()
+                                tc_result = f"{BASH_RESULT_START_TAG}The extraction command encountered an error. Please verify the command syntax.{BASH_RESULT_END_TAG}"
+                            else:
+                                debug_str.append("[LQ_DEBUG]: tool_call_content=" + tc_content)
+                                tc_result = ""
+                                try:
+                                    command_list = extract_command(tc_content)
+                                except:
+                                    tc_result = BASH_RESULT_START_TAG + "extract command fail!" + BASH_RESULT_END_TAG
+                                if tc_result == "" and command_list is not None:
+                                    for command in command_list:
+                                        debug_str.append("[LQ_DEBUG]: command=" + str(command))
+                                        stdout, stderr = "no stdout", "no stderr"
+                                        def extract_cpp_code_blocks(content):
+                                            #pattern = re.compile(r'```cpp\n(.*?)```\n', re.DOTALL)
+                                            pattern = re.compile(r'```(?:cpp|c\+\+)\n(.*?)```\n', re.DOTALL)
+                                            cpp_code_blocks = pattern.findall(content) 
+                                            return cpp_code_blocks
+                                        code_string_list = extract_cpp_code_blocks(all_response_str)
+                                        if len(code_string_list) == 0:
+                                            tc_result = BASH_RESULT_START_TAG + "did not find cpp code" + BASH_RESULT_END_TAG
+                                        else:
+                                            code_string = code_string_list[-1]
+                                            debug_str.append("[LQ_DEBUG]: code_string=" + code_string)
+                                            try:
+                                                md5_hash = hashlib.md5()
+                                                #md5_hash.update(code_string.encode("utf-8") + str(time.time()).encode("utf-8"))
+                                                md5_hash.update(code_string.encode("utf-8")) 
+                                                file_path = "/root/workspace/CP-Zero/tmp/" + md5_hash.hexdigest()
+                                                file_path_list.append(file_path)
+                                                os.makedirs(file_path, exist_ok=True)
+                                                file_name = file_path + "/main.cpp"
+                                                f = open(file_name, "w+")
+                                                f.write(code_string)
+                                                f.close()
+                                                try:
+                                                    result = subprocess.run(
+                                                            "cd " + file_path + " && " + command, 
+                                                            text=True, shell=True, capture_output=True, timeout=5)
+                                                    stdout = result.stdout
+                                                    if result.stderr:
+                                                        stderr = result.stderr
+                                                except subprocess.TimeoutExpired as e:
+                                                    stdout = ""
+                                                    stderr = "Command timed out after 5 seconds!"
+                                            except Exception as e:
+                                                stderr = "execute shell command fail"
+                                                print(f"An error occurred: {e}")
+                                            debug_str.append("[LQ_DEBUG]: stdout=" + str(stdout) + "stderr=" + str(stderr))
+                                            tc_result = f"{BASH_RESULT_START_TAG}after run the bash, the bash stdout is: {stdout}, stderr is: {stderr}{BASH_RESULT_END_TAG}"
+                            debug_str.append("[LQ_DEBUG]: tool_call_result=" + str(tc_result))
+                            tc_result_ids = self.tokenizer.encode(tc_result, add_special_tokens=False)
+                            output_single[0] += tc_result_ids
+                            output_single[1] += [0.0] * len(tc_result_ids)
+                            output_single[2] += [0] * len(tc_result_ids)
+                            prompt_token_ids = prompt_token_ids + generated_ids[0][0].tolist() + tc_result_ids
+                            if len(prompt_token_ids) > max_length:
+                                all_outputs.append([
+                                    output_single[0][:min(max_length, len(output_single[0]))],
+                                    output_single[1][:min(max_length, len(output_single[1]))],
+                                    output_single[2][:min(max_length, len(output_single[2]))],
+                                ])
+                                break
+                            continue
+                        all_outputs.append([
+                            output_single[0][:min(max_length, len(output_single[0]))],
+                            output_single[1][:min(max_length, len(output_single[1]))],
+                            output_single[2][:min(max_length, len(output_single[2]))],
+                        ])
+                        break
+                    #for file_path in file_path_list:
+                        #delete_directory(file_path)
+                    #setattr(self.sampling_params, "max_tokens", max_length)
+
+
+            #print("\n".join(debug_str))
+    
+            # Calculate the max length for padding
+            max_length_responses = max(len(o[0]) for o in all_outputs)
+            max_length_log_probs = max(len(o[1]) for o in all_outputs)
+    
+            # Pad response_ids and log_probs and convert them back to tensors
+            padded_response_ids = torch.tensor([
+                    o[0] + [151643] * (max_length_responses - len(o[0]))
+                    for o in all_outputs
+            ])
+            padded_log_probs = torch.tensor([
+                    o[1] + [0.0] * (max_length_log_probs - len(o[1]))
+                    for o in all_outputs
+            ])
+            padded_response_attention_mask = torch.tensor([
+                    o[2] + [0] * (max_length_log_probs - len(o[2]))
+                    for o in all_outputs
+            ])
+    
+            # Combine the padded response_ids and log_probs into a list of tuples of tensors
+            output = [padded_response_ids, padded_log_probs, padded_response_attention_mask]
 
         # TODO(sgm): disable logprob when recompute_log_prob is enable
         # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
         response = output[0].to(idx.device)
-        log_probs = output[1].to(idx.device)
+        res_mask = output[2].to(idx.device)
+        #log_probs = output[1].to(idx.device)
 
         if response.shape[1] < self.config.response_length:
             response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
-            log_probs = pad_sequence_to_length(log_probs, self.config.response_length, self.pad_token_id)
+            res_mask = pad_sequence_to_length(res_mask, self.config.response_length, 0)
+            #log_probs = pad_sequence_to_length(log_probs, self.config.response_length, self.pad_token_id)
 
         if self.config.n > 1 and do_sample:
             idx = idx.repeat_interleave(self.config.n, dim=0)
@@ -210,7 +378,14 @@ class vLLMRollout(BaseRollout):
         # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
         response_position_ids = position_ids[:, -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_attention_mask = get_eos_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        response_attention_mask = get_eos_mask(
+                #response_id=response, eos_token=eos_token_id, 
+                response_id=response, eos_token=[151643], 
+                dtype=attention_mask.dtype)
+        # TO BE FIX,这里会有些问题,包括可能需要多个token,以及有可能前后不一样的话,切出来的token也不一样
+        response_bash_result_attention_mask = res_mask.to(attention_mask.dtype)
+        print("DEBUG:", response_bash_result_attention_mask.shape, response_attention_mask.shape)
+        bash_result_attention_mask = torch.cat((attention_mask, response_bash_result_attention_mask), dim=-1)
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid
@@ -219,8 +394,9 @@ class vLLMRollout(BaseRollout):
                 'prompts': idx,
                 'responses': response,
                 'input_ids': seq,  # here input_ids become the whole sentences
-                # 'old_log_probs': log_probs, # we will recompute old log prob with actor
+                #'old_log_probs': log_probs, # we will recompute old log prob with actor
                 'attention_mask': attention_mask,
+                "bash_result_attention_mask": bash_result_attention_mask,
                 'position_ids': position_ids
             },
             batch_size=batch_size)
