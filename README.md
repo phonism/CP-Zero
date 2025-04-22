@@ -2,7 +2,7 @@
 本项目主要在Code Contest数据集上使用R1-Zero的方法进行训练，并得到了一些有意思的发现以及遇到了一些问题。大家感兴趣的话欢迎一起交流。
 
 # ChangeLog
-+ 2025.04.22: 增加generate时调用命令执行代码。具体可以参考`verl/workers/rollout/vllm_rollout/vllm_rollout.py`
++ 2025.04.01: 增加generate时调用命令执行代码。具体可以参考`verl/workers/rollout/vllm_rollout/vllm_rollout.py`，当前在7b模型上并没有显著的提升。
 
 ## 整体思路
 + 任务：Code Contests任务是给一个算法题的描述，然后模型给出代码，并在一些测试数据上测试是否正确。
